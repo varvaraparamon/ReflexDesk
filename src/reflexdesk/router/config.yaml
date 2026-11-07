@@ -1,0 +1,71 @@
+proxy:
+  base_url: ${LITELLM_URL:-}
+  api_key_env: LITELLM_MASTER_KEY
+
+providers:
+  deepseek:
+    base_url: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+    api_key_env: DEEPSEEK_API_KEY
+    structured: json_object
+  qwen:
+    base_url: ${QWEN_BASE_URL:-https://polza.ai/api/v1}
+    api_key_env: QWEN_API_KEY
+    structured: json_schema
+    reported_cost_currency: RUB
+  jev:
+    base_url: ${JEV_URL:-http://jev:8000/v1}
+    structured: json_schema
+
+fx_per_usd:
+  USD: 1.0
+  RUB: ${RUB_PER_USD:-80}
+
+retry:
+  attempts: 2
+  backoff_s: 1.0
+
+tiers:
+  gateway:
+    provider: jev
+    model: ${JEV_MODEL:-tacit-4b}
+    family: qwen
+    mode: logits
+    timeout_s: 60
+  tier0:
+    provider: jev
+    model: ${JEV_MODEL:-tacit-4b}
+    family: qwen
+    mode: instruct
+    extra_body: {chat_template_kwargs: {enable_thinking: false}}
+    cache_ttl_s: 86400
+    timeout_s: 60
+  tier1:
+    provider: qwen
+    model: ${QWEN_MODEL:-qwen/qwen3.8-flash}
+    family: qwen
+    mode: instruct
+    extra_body: {reasoning: {enabled: false}}
+    cache_ttl_s: 86400
+    timeout_s: 90
+    price_per_mtok: {input: 0.21, output: 0.66}
+  tier2:
+    provider: deepseek
+    model: deepseek-flash
+    family: deepseek
+    mode: instruct
+    extra_body: {thinking: {type: disabled}}
+    timeout_s: 30
+    fallback: tier1
+    budget_per_run_usd: 0.20
+    price_per_mtok: {input: 0.30, cached_input: 0.006, output: 1.20}
+  tier3:
+    provider: qwen
+    model: ${QWEN_MODEL:-qwen/qwen3.8-flash}
+    family: qwen
+    mode: reasoning
+    extra_body: {reasoning: {enabled: true, max_tokens: 3072}}
+    timeout_s: 180
+    fallback: tier2
+    fallback_flag: degraded_validation
+    budget_per_run_usd: 0.10
+    price_per_mtok: {input: 0.21, output: 0.66}

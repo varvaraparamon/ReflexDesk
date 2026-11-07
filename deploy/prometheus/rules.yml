@@ -1,0 +1,63 @@
+groups:
+  - name: reflexdesk-recording
+    rules:
+      - record: vram_used_bytes
+        expr: nvidia_smi_memory_used_bytes
+      - record: vram_total_bytes
+        expr: nvidia_smi_memory_total_bytes
+
+  - name: reflexdesk-alerts
+    rules:
+      - alert: BudgetBurn
+        expr: sum(increase(llm_cost_usd_total[1d])) > 3
+        labels: {severity: critical}
+        annotations:
+          summary: "Расход на LLM за сутки превысил $3"
+
+      - alert: ValidationDegraded
+        expr: sum(rate(validation_rejected_total[1h])) / sum(rate(graph_runs_total[1h])) > 0.2
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Доля отклонений Validator > 20% прогонов за час"
+
+      - alert: ToolFlapping
+        expr: sum by (tool) (rate(tool_calls_total{status="error"}[15m])) / sum by (tool) (rate(tool_calls_total[15m])) > 0.3
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Тул {{ $labels.tool }}: доля ошибок > 30%"
+
+      - alert: GatewayDrift
+        expr: sum(rate(jev_fallback_total[1h])) / sum(rate(gateway_decisions_total[1h])) > 0.4
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Гейты массово неуверенны: доля fallback на T0 > 40%"
+
+      - alert: ReflectorStale
+        expr: max(predictions_stale) > 0
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "Есть pending-прогнозы, просроченные более чем на 2 дня"
+
+      - alert: GpuSaturated
+        expr: max(vram_used_bytes / vram_total_bytes) > 0.95
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "VRAM занята > 95% в течение 10 минут"
+
+      - alert: EvalRegression
+        expr: min_over_time(eval_score{suite=~"golden_.*", metric="regression"}[36h]) == 1
+        labels: {severity: critical}
+        annotations:
+          summary: "Падение judge-score golden-set два ночных прогона подряд"
+
+      - alert: DependencyDown
+        expr: up{job=~"app|qdrant|reflector|evals"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "Сервис {{ $labels.job }} недоступен"

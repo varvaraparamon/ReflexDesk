@@ -1,0 +1,330 @@
+name: reflexdesk
+
+x-app-env: &app-env
+  DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+  SEC_USER_AGENT: ${SEC_USER_AGENT}
+  FRED_API_KEY: ${FRED_API_KEY:-}
+  DATABASE_URL: postgresql://desk:${POSTGRES_PASSWORD}@postgres:5432/reflexdesk
+  CHECKPOINT_URL: postgresql://desk:${POSTGRES_PASSWORD}@postgres:5432/reflexdesk
+  QDRANT_URL: http://qdrant:6333
+  LITELLM_URL: http://litellm:4000
+  LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+  JEV_URL: http://jev:8000/v1
+  QWEN_API_KEY: ${QWEN_API_KEY}
+  RUB_PER_USD: ${RUB_PER_USD:-80}
+  GATEWAY_READOUT: ${GATEWAY_READOUT:-one_forward}
+  SANDBOX_SOCKET: /run/sandbox/sandbox.sock
+  TRACING_ENABLED: "true"
+  LANGFUSE_HOST: http://langfuse-web:3000
+  LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+  LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+  RISK_OFFICER_ALWAYS: ${RISK_OFFICER_ALWAYS:-false}
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: deploy/app/Dockerfile
+  image: reflexdesk/app:latest
+  environment: *app-env
+  volumes:
+    - app_data:/data
+    - sandbox_socket:/run/sandbox
+  networks: [backend]
+  restart: unless-stopped
+
+x-gpu: &gpu
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
+
+x-langfuse-env: &langfuse-env
+  DATABASE_URL: postgresql://langfuse:${LANGFUSE_DB_PASSWORD}@langfuse-postgres:5432/langfuse
+  SALT: ${LANGFUSE_SALT}
+  ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY}
+  TELEMETRY_ENABLED: "false"
+  CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+  CLICKHOUSE_URL: http://clickhouse:8123
+  CLICKHOUSE_USER: clickhouse
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_PASSWORD}
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_AUTH: ${REDIS_PASSWORD}
+
+services:
+  app:
+    <<: *app
+    ports: ["127.0.0.1:8000:8000"]
+    networks: [frontend, backend]
+    depends_on:
+      postgres: {condition: service_healthy}
+      qdrant: {condition: service_started}
+      litellm: {condition: service_started}
+      sandbox: {condition: service_started}
+      jev: {condition: service_healthy}
+      langfuse-web: {condition: service_started}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 15s
+      retries: 5
+
+  reflector:
+    <<: *app
+    command: ["python", "scripts/reflector_cron.py", "--metrics-port", "9101"]
+    depends_on: [app]
+
+  evals:
+    <<: *app
+    command: ["python", "scripts/eval_runner.py", "--metrics-port", "9102", "--limit", "${GOLDEN_NIGHTLY_LIMIT:-10}"]
+    depends_on: [app]
+
+  bot:
+    image: reflexdesk/app:latest
+    command: ["python", "-m", "reflexdesk.bot"]
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_ALLOWED_CHAT_IDS: ${TELEGRAM_ALLOWED_CHAT_IDS}
+      DESK_API_URL: http://app:8000
+      BOT_STATE_PATH: /state/bot_state.json
+    volumes: [bot_state:/state]
+    depends_on:
+      app: {condition: service_healthy}
+    networks: [backend]
+    restart: unless-stopped
+
+  sandbox:
+    build:
+      context: .
+      dockerfile: deploy/sandbox/Dockerfile
+    image: reflexdesk/sandbox:latest
+    runtime: ${SANDBOX_RUNTIME:-runsc}
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    volumes:
+      - sandbox_socket:/run/sandbox
+    mem_limit: 1g
+    pids_limit: 128
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  jev:
+    <<: *gpu
+    image: ${VLLM_IMAGE:-vllm/vllm-openai@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34}
+    command: >
+      --model morriszjm/Tacit-4B --served-model-name tacit-4b
+      --quantization fp8 --gpu-memory-utilization ${JEV_GPU_UTIL:-0.75}
+      --enforce-eager --max-model-len 4096 --max-logprobs 20 --host 0.0.0.0 --port 8000
+    volumes: [hf_cache:/root/.cache/huggingface]
+    ipc: host
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 15s
+      start_period: 600s
+      retries: 10
+    restart: unless-stopped
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      QWEN_API_KEY: ${QWEN_API_KEY}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+    volumes: ["./deploy/litellm/config.yaml:/app/config.yaml:ro"]
+    networks: [backend]
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: desk
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: reflexdesk
+    volumes: [pg_data:/var/lib/postgresql/data]
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U desk -d reflexdesk"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    volumes: [qdrant_data:/qdrant/storage]
+    networks: [backend]
+    restart: unless-stopped
+
+  langfuse-web:
+    image: langfuse/langfuse:3
+    ports: ["127.0.0.1:3000:3000"]
+    environment:
+      <<: *langfuse-env
+      NEXTAUTH_URL: ${LANGFUSE_PUBLIC_URL:-http://localhost:3000}
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET}
+      LANGFUSE_INIT_ORG_ID: reflexdesk
+      LANGFUSE_INIT_ORG_NAME: ReflexDesk
+      LANGFUSE_INIT_PROJECT_ID: reflexdesk
+      LANGFUSE_INIT_PROJECT_NAME: reflexdesk
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_ADMIN_EMAIL:-admin@reflexdesk.local}
+      LANGFUSE_INIT_USER_NAME: admin
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_ADMIN_PASSWORD}
+    depends_on:
+      langfuse-postgres: {condition: service_started}
+      clickhouse: {condition: service_started}
+      redis: {condition: service_started}
+      minio-init: {condition: service_completed_successfully}
+    networks: [frontend, backend]
+    restart: unless-stopped
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    environment: *langfuse-env
+    depends_on:
+      langfuse-postgres: {condition: service_started}
+      clickhouse: {condition: service_started}
+      redis: {condition: service_started}
+      minio-init: {condition: service_completed_successfully}
+    networks: [backend]
+    restart: unless-stopped
+
+  langfuse-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: ${LANGFUSE_DB_PASSWORD}
+      POSTGRES_DB: langfuse
+    volumes: [langfuse_pg:/var/lib/postgresql/data]
+    networks: [backend]
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    volumes: [clickhouse_data:/var/lib/clickhouse]
+    networks: [backend]
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    networks: [backend]
+    restart: unless-stopped
+
+  minio:
+    image: cgr.dev/chainguard/minio@sha256:3b6e40c30ecd5cea627e382ff0b82ca841f58c52294578787043ee80c8ef7c82
+    command: ["server", "/data", "--address", ":9000", "--console-address", ":9001"]
+    user: "0:0"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
+    volumes: [minio_data:/data]
+    networks: [backend]
+    restart: unless-stopped
+
+  minio-init:
+    image: cgr.dev/chainguard/minio-client@sha256:5b759d9e248ad9f1ab8455f8168b86a47acb1e08207d38603b504bdc5a555d7a
+    command: ["mb", "--ignore-existing", "store/langfuse"]
+    environment:
+      MC_HOST_store: http://minio:${MINIO_PASSWORD}@minio:9000
+    depends_on: [minio]
+    networks: [backend]
+    restart: on-failure
+
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/rules.yml:/etc/prometheus/rules.yml:ro
+      - prom_data:/prometheus
+    ports: ["127.0.0.1:9090:9090"]
+    networks: [backend]
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.34.2
+    entrypoint: sh
+    command:
+      - -c
+      - >
+        sed -e "s|\$${TELEGRAM_BOT_TOKEN}|$$TELEGRAM_BOT_TOKEN|" -e "s|\$${TELEGRAM_CHAT_ID}|$$TELEGRAM_CHAT_ID|"
+        /etc/alertmanager/alertmanager.yml.tmpl > /tmp/alertmanager.yml
+        && exec /bin/alertmanager --config.file=/tmp/alertmanager.yml --storage.path=/alertmanager
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+    volumes: ["./deploy/alertmanager/alertmanager.yml.tmpl:/etc/alertmanager/alertmanager.yml.tmpl:ro"]
+    networks: [backend]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.3.0
+    ports: ["127.0.0.1:3001:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      LANGFUSE_PUBLIC_URL: ${LANGFUSE_PUBLIC_URL:-http://localhost:3000}
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks: [frontend, backend]
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.3.2
+    command: ["-config.file=/etc/loki/loki.yml"]
+    volumes:
+      - ./deploy/loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+    networks: [backend]
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:3.3.2
+    command: ["-config.file=/etc/promtail/promtail.yml"]
+    volumes:
+      - ./deploy/promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [backend]
+    restart: unless-stopped
+
+  gpu_exporter:
+    <<: *gpu
+    image: utkuozdemir/nvidia_gpu_exporter:1.3.1
+    networks: [backend]
+    restart: unless-stopped
+
+networks:
+  frontend:
+  backend:
+
+volumes:
+  bot_state:
+  hf_cache:
+  app_data:
+  sandbox_socket:
+  pg_data:
+  qdrant_data:
+  langfuse_pg:
+  clickhouse_data:
+  minio_data:
+  prom_data:
+  loki_data:

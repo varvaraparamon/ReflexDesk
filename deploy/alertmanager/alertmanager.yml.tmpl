@@ -12,3 +12,7 @@ receivers:
         chat_id: ${TELEGRAM_CHAT_ID}
         parse_mode: HTML
         send_resolved: true
+        message: |-
+          {{ range .Alerts }}{{ if eq .Status "firing" }}🔴{{ else }}✅{{ end }} <b>{{ .Labels.alertname }}</b>
+          {{ .Annotations.summary }}
+          {{ end }}
